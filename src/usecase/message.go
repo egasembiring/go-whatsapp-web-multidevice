@@ -11,12 +11,12 @@ import (
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	domainMessage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/message"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
+	pkgError "github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/error"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/validations"
 	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
-	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/types"
@@ -37,13 +37,19 @@ func (service serviceMessage) MarkAsRead(ctx context.Context, request domainMess
 	if err = validations.ValidateMarkAsRead(ctx, request); err != nil {
 		return response, err
 	}
-	dataWaRecipient, err := utils.ValidateJidWithLogin(whatsapp.GetClient(), request.Phone)
+
+	client := whatsapp.ClientFromContext(ctx)
+	if client == nil {
+		return response, pkgError.ErrWaCLI
+	}
+
+	dataWaRecipient, err := utils.ValidateJidWithLogin(client, request.Phone)
 	if err != nil {
 		return response, err
 	}
 
 	ids := []types.MessageID{request.MessageID}
-	if err = whatsapp.GetClient().MarkRead(ids, time.Now(), dataWaRecipient, *whatsapp.GetClient().Store.ID); err != nil {
+	if err = client.MarkRead(ctx, ids, time.Now(), dataWaRecipient, *client.Store.ID); err != nil {
 		return response, err
 	}
 
@@ -51,7 +57,7 @@ func (service serviceMessage) MarkAsRead(ctx context.Context, request domainMess
 		"phone":      request.Phone,
 		"message_id": request.MessageID,
 		"chat":       dataWaRecipient.String(),
-		"sender":     whatsapp.GetClient().Store.ID.String(),
+		"sender":     client.Store.ID.String(),
 	})
 
 	response.MessageID = request.MessageID
@@ -63,23 +69,47 @@ func (service serviceMessage) ReactMessage(ctx context.Context, request domainMe
 	if err = validations.ValidateReactMessage(ctx, request); err != nil {
 		return response, err
 	}
-	dataWaRecipient, err := utils.ValidateJidWithLogin(whatsapp.GetClient(), request.Phone)
+
+	client := whatsapp.ClientFromContext(ctx)
+	if client == nil {
+		return response, pkgError.ErrWaCLI
+	}
+
+	dataWaRecipient, err := utils.ValidateJidWithLogin(client, request.Phone)
 	if err != nil {
 		return response, err
 	}
 
-	msg := &waE2E.Message{
-		ReactionMessage: &waE2E.ReactionMessage{
-			Key: &waCommon.MessageKey{
-				FromMe:    proto.Bool(true),
-				ID:        proto.String(request.MessageID),
-				RemoteJID: proto.String(dataWaRecipient.String()),
-			},
-			Text:              proto.String(request.Emoji),
-			SenderTimestampMS: proto.Int64(time.Now().UnixMilli()),
-		},
+	// Determine the sender of the original message for BuildReaction.
+	// BuildReaction uses BuildMessageKey internally, which correctly sets the
+	// Participant field for group chats — required by the WhatsApp protocol.
+	// An empty JID means "message was from me".
+	senderJID := types.EmptyJID
+	message, err := service.chatStorageRepo.GetMessageByID(request.MessageID)
+	if err != nil {
+		logrus.Warnf("Failed to lookup message %s for reaction: %v, using heuristic", request.MessageID, err)
+		if len(request.MessageID) > 22 {
+			if dataWaRecipient.Server == types.GroupServer {
+				logrus.Warnf("Cannot determine original sender for group reaction to %s — reaction may not be delivered", request.MessageID)
+			}
+		}
+	} else if message != nil {
+		if !message.IsFromMe && message.Sender != "" {
+			parsed, parseErr := utils.ParseJID(message.Sender)
+			if parseErr == nil {
+				senderJID = parsed
+			} else {
+				logrus.Warnf("Failed to parse sender JID '%s' for reaction: %v", message.Sender, parseErr)
+			}
+		}
+	} else {
+		logrus.Debugf("Message %s not found in database, assuming sent by me", request.MessageID)
 	}
-	ts, err := whatsapp.GetClient().SendMessage(ctx, dataWaRecipient, msg)
+
+	// BuildReaction correctly constructs the MessageKey with Participant field
+	// for group chats, which is required for the reaction to be delivered.
+	msg := client.BuildReaction(dataWaRecipient, senderJID, request.MessageID, request.Emoji)
+	ts, err := client.SendMessage(ctx, dataWaRecipient, msg)
 	if err != nil {
 		return response, err
 	}
@@ -93,12 +123,39 @@ func (service serviceMessage) RevokeMessage(ctx context.Context, request domainM
 	if err = validations.ValidateRevokeMessage(ctx, request); err != nil {
 		return response, err
 	}
-	dataWaRecipient, err := utils.ValidateJidWithLogin(whatsapp.GetClient(), request.Phone)
+
+	client := whatsapp.ClientFromContext(ctx)
+	if client == nil {
+		return response, pkgError.ErrWaCLI
+	}
+
+	dataWaRecipient, err := utils.ValidateJidWithLogin(client, request.Phone)
 	if err != nil {
 		return response, err
 	}
 
-	ts, err := whatsapp.GetClient().SendMessage(context.Background(), dataWaRecipient, whatsapp.GetClient().BuildRevoke(dataWaRecipient, types.EmptyJID, request.MessageID))
+	// Resolve the original sender so group admins can revoke other members'
+	// messages. BuildRevoke treats types.EmptyJID as "message was from me";
+	// any other JID is admin-revoke and requires the bot to be group admin.
+	// WhatsApp message IDs are globally unique, so a cross-device lookup
+	// via GetMessageByID yields the same sender regardless of which device
+	// owns the row.
+	senderJID := types.EmptyJID
+	message, lookupErr := service.chatStorageRepo.GetMessageByID(request.MessageID)
+	if lookupErr != nil {
+		logrus.Warnf("Failed to lookup message %s for revoke: %v, assuming self-revoke", request.MessageID, lookupErr)
+	} else if message != nil && !message.IsFromMe && message.Sender != "" {
+		parsed, parseErr := utils.ParseJID(message.Sender)
+		if parseErr != nil {
+			logrus.Warnf("Failed to parse sender JID '%s' for revoke: %v", message.Sender, parseErr)
+		} else {
+			// Stored senders can still be @lid; whatsmeow's Revoke needs
+			// the phone-number form or it rejects the request at the wire.
+			senderJID = whatsapp.NormalizeJIDFromLID(ctx, parsed, client)
+		}
+	}
+
+	ts, err := client.SendMessage(ctx, dataWaRecipient, client.BuildRevoke(dataWaRecipient, senderJID, request.MessageID))
 	if err != nil {
 		return response, err
 	}
@@ -112,7 +169,13 @@ func (service serviceMessage) DeleteMessage(ctx context.Context, request domainM
 	if err = validations.ValidateDeleteMessage(ctx, request); err != nil {
 		return err
 	}
-	dataWaRecipient, err := utils.ValidateJidWithLogin(whatsapp.GetClient(), request.Phone)
+
+	client := whatsapp.ClientFromContext(ctx)
+	if client == nil {
+		return pkgError.ErrWaCLI
+	}
+
+	dataWaRecipient, err := utils.ValidateJidWithLogin(client, request.Phone)
 	if err != nil {
 		return err
 	}
@@ -126,7 +189,7 @@ func (service serviceMessage) DeleteMessage(ctx context.Context, request domainM
 		Timestamp: time.Now(),
 		Type:      appstate.WAPatchRegularHigh,
 		Mutations: []appstate.MutationInfo{{
-			Index: []string{appstate.IndexDeleteMessageForMe, dataWaRecipient.String(), request.MessageID, isFromMe, whatsapp.GetClient().Store.ID.String()},
+			Index: []string{appstate.IndexDeleteMessageForMe, dataWaRecipient.String(), request.MessageID, isFromMe, client.Store.ID.String()},
 			Value: &waSyncAction.SyncActionValue{
 				DeleteMessageForMeAction: &waSyncAction.DeleteMessageForMeAction{
 					DeleteMedia:      proto.Bool(true),
@@ -136,7 +199,7 @@ func (service serviceMessage) DeleteMessage(ctx context.Context, request domainM
 		}},
 	}
 
-	if err = whatsapp.GetClient().SendAppState(ctx, patchInfo); err != nil {
+	if err = client.SendAppState(ctx, patchInfo); err != nil {
 		return err
 	}
 	return nil
@@ -147,13 +210,18 @@ func (service serviceMessage) UpdateMessage(ctx context.Context, request domainM
 		return response, err
 	}
 
-	dataWaRecipient, err := utils.ValidateJidWithLogin(whatsapp.GetClient(), request.Phone)
+	client := whatsapp.ClientFromContext(ctx)
+	if client == nil {
+		return response, pkgError.ErrWaCLI
+	}
+
+	dataWaRecipient, err := utils.ValidateJidWithLogin(client, request.Phone)
 	if err != nil {
 		return response, err
 	}
 
 	msg := &waE2E.Message{Conversation: proto.String(request.Message)}
-	ts, err := whatsapp.GetClient().SendMessage(context.Background(), dataWaRecipient, whatsapp.GetClient().BuildEdit(dataWaRecipient, request.MessageID, msg))
+	ts, err := client.SendMessage(ctx, dataWaRecipient, client.BuildEdit(dataWaRecipient, request.MessageID, msg))
 	if err != nil {
 		return response, err
 	}
@@ -169,7 +237,12 @@ func (service serviceMessage) StarMessage(ctx context.Context, request domainMes
 		return err
 	}
 
-	dataWaRecipient, err := utils.ValidateJidWithLogin(whatsapp.GetClient(), request.Phone)
+	client := whatsapp.ClientFromContext(ctx)
+	if client == nil {
+		return pkgError.ErrWaCLI
+	}
+
+	dataWaRecipient, err := utils.ValidateJidWithLogin(client, request.Phone)
 	if err != nil {
 		return err
 	}
@@ -179,9 +252,9 @@ func (service serviceMessage) StarMessage(ctx context.Context, request domainMes
 		isFromMe = false
 	}
 
-	patchInfo := appstate.BuildStar(dataWaRecipient.ToNonAD(), *whatsapp.GetClient().Store.ID, request.MessageID, isFromMe, request.IsStarred)
+	patchInfo := appstate.BuildStar(dataWaRecipient.ToNonAD(), *client.Store.ID, request.MessageID, isFromMe, request.IsStarred)
 
-	if err = whatsapp.GetClient().SendAppState(ctx, patchInfo); err != nil {
+	if err = client.SendAppState(ctx, patchInfo); err != nil {
 		return err
 	}
 	return nil
@@ -193,7 +266,12 @@ func (service serviceMessage) DownloadMedia(ctx context.Context, request domainM
 		return response, err
 	}
 
-	dataWaRecipient, err := utils.ValidateJidWithLogin(whatsapp.GetClient(), request.Phone)
+	client := whatsapp.ClientFromContext(ctx)
+	if client == nil {
+		return response, pkgError.ErrWaCLI
+	}
+
+	dataWaRecipient, err := utils.ValidateJidWithLogin(client, request.Phone)
 	if err != nil {
 		return response, err
 	}
@@ -277,7 +355,7 @@ func (service serviceMessage) DownloadMedia(ctx context.Context, request domainM
 	}
 
 	// Download the media using existing utils.ExtractMedia function
-	extractedMedia, err := utils.ExtractMedia(ctx, whatsapp.GetClient(), dateDir, downloadableMsg.(whatsmeow.DownloadableMessage))
+	extractedMedia, err := utils.ExtractMedia(ctx, client, dateDir, downloadableMsg.(whatsmeow.DownloadableMessage))
 	if err != nil {
 		return response, fmt.Errorf("failed to download media: %v", err)
 	}

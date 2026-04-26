@@ -7,6 +7,7 @@ type ListChatsRequest struct {
 	Offset   int    `json:"offset" query:"offset"`
 	Search   string `json:"search" query:"search"`
 	HasMedia bool   `json:"has_media" query:"has_media"`
+	Archived *bool  `json:"archived" query:"archived"`
 }
 
 type ListChatsResponse struct {
@@ -51,25 +52,54 @@ type ChatInfo struct {
 	EphemeralExpiration uint32 `json:"ephemeral_expiration"`
 	CreatedAt           string `json:"created_at"`
 	UpdatedAt           string `json:"updated_at"`
+	Archived            bool   `json:"archived"`
 }
 
 type MessageInfo struct {
-	ID         string `json:"id"`
-	ChatJID    string `json:"chat_jid"`
-	SenderJID  string `json:"sender_jid"`
-	Content    string `json:"content"`
-	Timestamp  string `json:"timestamp"`
-	IsFromMe   bool   `json:"is_from_me"`
-	MediaType  string `json:"media_type"`
-	Filename   string `json:"filename"`
-	URL        string `json:"url"`
-	FileLength uint64 `json:"file_length"`
-	CreatedAt  string `json:"created_at"`
-	UpdatedAt  string `json:"updated_at"`
+	ID        string `json:"id"`
+	ChatJID   string `json:"chat_jid"`
+	SenderJID string `json:"sender_jid"`
+	Content   string `json:"content"`
+	Timestamp string `json:"timestamp"`
+	IsFromMe  bool   `json:"is_from_me"`
+	MediaType string `json:"media_type"`
+	// CallMetadata is JSON when media_type is "call" (incoming call log).
+	CallMetadata string `json:"call_metadata,omitempty"`
+	Filename     string `json:"filename"`
+	URL          string `json:"url"`
+	FileLength   uint64 `json:"file_length"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
 }
 
 type PaginationResponse struct {
 	Limit  int `json:"limit"`
 	Offset int `json:"offset"`
 	Total  int `json:"total"`
+}
+
+// Disappearing Messages operations
+type SetDisappearingTimerRequest struct {
+	ChatJID      string `json:"chat_jid" uri:"chat_jid"`
+	TimerSeconds uint32 `json:"timer_seconds"`
+}
+
+type SetDisappearingTimerResponse struct {
+	Status       string `json:"status"`
+	Message      string `json:"message"`
+	ChatJID      string `json:"chat_jid"`
+	TimerSeconds uint32 `json:"timer_seconds"`
+}
+
+// Archive Chat operations
+type ArchiveChatRequest struct {
+	ChatJID  string `json:"chat_jid" uri:"chat_jid"`
+	Archived bool   `json:"archived"`
+}
+
+type ArchiveChatResponse struct {
+	Status   string `json:"status"`
+	Message  string `json:"message"`
+	ChatJID  string `json:"chat_jid"`
+	Archived bool   `json:"archived"`
 }

@@ -6,6 +6,7 @@ export default {
             loading: false,
             searchQuery: '',
             includeMediaChats: false,
+            archiveFilter: '',
             currentPage: 1,
             pageSize: 10,
             totalChats: 0,
@@ -26,12 +27,11 @@ export default {
     },
     methods: {
         openModal() {
-            $('#modalChatList').modal({
-                onApprove: function () {
-                    return false;
-                }
-            }).modal('show');
+            $('#modalChatList').modal('show');
             this.loadChats();
+        },
+        closeModal() {
+            $('#modalChatList').modal('hide');
         },
         async loadChats() {
             this.loading = true;
@@ -47,6 +47,10 @@ export default {
                 
                 if (this.includeMediaChats) {
                     params.append('has_media', 'true');
+                }
+
+                if (this.archiveFilter !== '') {
+                    params.append('archived', this.archiveFilter);
                 }
 
                 const response = await window.http.get(`/chats?${params}`);
@@ -78,16 +82,17 @@ export default {
             this.selectedChatJid = jid;
             // Store the JID for the chat messages component
             localStorage.setItem('selectedChatJid', jid);
-            
-            // Close the current modal and trigger ChatMessages openModal method
-            $('#modalChatList').modal({
-                onHidden: function() {
-                    setTimeout(() => {
-                        // Trigger a custom event to open ChatMessages modal properly
-                        window.dispatchEvent(new CustomEvent('openChatMessages'));
-                    }, 100);
+
+            // Close the current modal
+            $('#modalChatList').modal('hide');
+
+            // Directly open ChatMessages modal after ChatList modal closes
+            setTimeout(() => {
+                // Find the ChatMessages component and call its openModal method
+                if (window.ChatMessagesComponent && window.ChatMessagesComponent.openModal) {
+                    window.ChatMessagesComponent.openModal();
                 }
-            }).modal('hide');
+            }, 200);
         },
         formatTimestamp(timestamp) {
             if (!timestamp) return 'N/A';
@@ -100,6 +105,16 @@ export default {
             return 'Other';
         }
     },
+    mounted() {
+        // Expose the component globally for other components to access
+        window.ChatListComponent = this;
+    },
+    beforeUnmount() {
+        // Clean up global reference
+        if (window.ChatListComponent === this) {
+            delete window.ChatListComponent;
+        }
+    },
     template: `
     <div class="purple card" @click="openModal()" style="cursor: pointer">
         <div class="content">
@@ -110,7 +125,7 @@ export default {
             </div>
         </div>
     </div>
-    
+
     <!--  Modal ChatList  -->
     <div class="ui large modal" id="modalChatList">
         <i class="close icon"></i>
@@ -121,7 +136,7 @@ export default {
         <div class="content">
             <div class="ui form">
                 <div class="fields">
-                    <div class="twelve wide field">
+                    <div class="eight wide field">
                         <label>Search Chats</label>
                         <div class="ui icon input">
                             <input type="text" 
@@ -137,6 +152,14 @@ export default {
                             <input type="checkbox" v-model="includeMediaChats" @change="searchChats">
                             <label>Media chats only</label>
                         </div>
+                    </div>
+                    <div class="four wide field">
+                        <label>Archive Filter</label>
+                        <select class="ui dropdown" v-model="archiveFilter" @change="searchChats">
+                            <option value="">All Chats</option>
+                            <option value="true">Archived</option>
+                            <option value="false">Non-Archived</option>
+                        </select>
                     </div>
                 </div>
             </div>
